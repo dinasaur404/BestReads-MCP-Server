@@ -1,4 +1,4 @@
-# BestReads MCP Server
+# BestReads MCP Server 📚🤔
 
 This is a remote MCP server, built on [Cloudflare Workers](https://workers.cloudflare.com/), that provides personalized book recommendation. 
 
