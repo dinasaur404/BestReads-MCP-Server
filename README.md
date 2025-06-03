@@ -1,19 +1,24 @@
 # BestReads MCP Server
 
-This is a remote Model Context Protocol (MCP) server, built on Cloudflare Workers, that provides personalized book recommendation. 
+This is a remote MCP server, built on [Cloudflare Workers](https://workers.cloudflare.com/), that provides personalized book recommendation. 
 
-This was built using Cloudflare's [guide](https://developers.cloudflare.com/agents/guides/remote-mcp-server/) on deploying remote MCP servers. It uses the Agents SDK to build the MCP server, Durable Objects to persistent the user's book preferences, Workers AI to generate a book recommendation, and Cloudflare's OAuth Provider library to add GitHub as an authentication provider. The MCP server supports Server-Sent Events (/sse) and Streamable HTTP (/mcp) transport methods. 
+This was built using Cloudflare's [guide](https://developers.cloudflare.com/agents/guides/remote-mcp-server/) on deploying remote MCP servers. It uses the [Agents SDK](https://developers.cloudflare.com/agents/) to build the MCP server, [Durable Objects](https://developers.cloudflare.com/durable-objects/) to persist the user's book preferences, [Workers AI](https://developers.cloudflare.com/workers-ai/) to generate book recommendations, and Cloudflare's [OAuth Provider library](https://github.com/cloudflare/workers-oauth-provider) to add GitHub as an authentication provider. The MCP server supports Server-Sent Events (/sse) and Streamable HTTP (/mcp) [transport methods](https://developers.cloudflare.com/agents/model-context-protocol/transport/). 
 
-##Available Tools
+### Get Started
+To try it out, connect to `https://bestreads.dinas.workers.dev/sse` or `https://bestreads.dinas.workers.dev/mcp`, if your MCP client supports Streamable HTTP. Or, deploy it yourself using the Deploy to Cloudflare button + instructions below. 
 
-getProfile - View your reading history and preferences
-addGenre - Add favorite book genres
-addFavoriteAuthor - Add authors you enjoy
-addBookRead - Track books you've read
-addDislikedBook - Mark books you didn't enjoy
-addDislikedAuthor - Authors to avoid in recommendations
-clearPreferences - Reset all preferences
-getBookRecommendations - Get AI-powered personalized book suggestions
+[![Deploy to Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/dinasaur404/BestReads-MCP-Server)
+
+## Available Tools
+
+- getProfile - View your reading history and preferences
+- addGenre - Add favorite book genres
+- addFavoriteAuthor - Add authors you enjoy
+- addBookRead - Track books you've read
+- addDislikedBook - Mark books you didn't enjoy
+- addDislikedAuthor - Authors to avoid in recommendations
+- clearPreferences - Reset all preferences
+- getBookRecommendations - Get AI-powered personalized book suggestions
 
 ## Deploy the MCP server
 
@@ -26,13 +31,13 @@ getBookRecommendations - Get AI-powered personalized book suggestions
    npm install
    ```
 
-2. Create a GitHub OAuth App
+2. Create a [GitHub OAuth App](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app)
 
 - Once you create teh OAuth App, set the Authorization callback URL to https://your-worker-domain.workers.dev/callback
 - Note the ClientID and Client Secret. You will add those to your Wrangler file. 
 - (Optional) Generate Cookie Encryption Key
 
-3. Upgrade wrangler.toml file
+3. Upgrade your `wrangler.toml` file
 ```
 [vars]
 GITHUB_CLIENT_ID = "your_github_client_id"
