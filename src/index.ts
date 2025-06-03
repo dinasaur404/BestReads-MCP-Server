@@ -1,21 +1,21 @@
-// src/index.ts
 import OAuthProvider from "@cloudflare/workers-oauth-provider";
-import { GitHubHandler } from "./github-handler";
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { GitHubHandler } from "./github-handler";
+import { DurableObject } from "cloudflare:workers";
 
-// Environment interface matching our wrangler.json setup
 interface Env {
   GITHUB_CLIENT_ID: string;
   GITHUB_CLIENT_SECRET: string;
   COOKIE_ENCRYPTION_KEY: string;
   OAUTH_KV: KVNamespace;
   MCP_OBJECT: DurableObjectNamespace;
+  USER_BOOK_PREFERENCES: DurableObjectNamespace;
   AI: any;
 }
 
-// User authentication context passed to MCP agent
+// User authentication context that will be passed to MCP agent
 export type Props = {
   login: string;
   name: string;
@@ -28,94 +28,167 @@ export type Props = {
 interface BookPreferences {
   userName: string;
   favoriteGenres: string[];
+  favoriteAuthors: string[];
   booksRead: Array<{
     title: string;
     author: string;
-    rating: number;
     dateAdded: string;
   }>;
-  sessionStarted: string;
-  interactionCount: number;
+  dislikedBooks: Array<{
+    title: string;
+    author: string;
+    dateAdded: string;
+  }>;
+  dislikedAuthors: string[];
 }
 
-export class MyMCP extends McpAgent<Env, BookPreferences, Props> {
+// Durable Object class for storing user book preferences
+export class UserBookPreferences extends DurableObject {
+  private preferences: BookPreferences | null = null;
+
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
-    console.log(`📚 MyMCP DEBUG:
-      - Props login: ${this.props?.login}
-      - Props githubId: ${this.props?.githubId} 
+  }
+
+  async getPreferences(): Promise<BookPreferences> {
+    if (!this.preferences) {
+      this.preferences = await this.ctx.storage.get<BookPreferences>("preferences");
+      
+      if (!this.preferences) {
+        this.preferences = {
+          userName: "",
+          favoriteGenres: [],
+          favoriteAuthors: [],
+          booksRead: [],
+          dislikedBooks: [],
+          dislikedAuthors: [],
+        };
+        await this.ctx.storage.put("preferences", this.preferences);
+      }
+    }
+    return this.preferences;
+  }
+
+  async updatePreferences(newPreferences: BookPreferences): Promise<void> {
+    this.preferences = newPreferences;
+    await this.ctx.storage.put("preferences", this.preferences);
+  }
+}
+
+export class MyMCP extends McpAgent<Env, never, Props> {
+  private _server: McpServer | undefined;
+
+  set server(server: McpServer) {
+    this._server = server;
+  }
+
+  get server(): McpServer {
+    if (!this._server) {
+      throw new Error('Tried to access server before it was initialized');
+    }
+    return this._server;
+  }
+
+  constructor(state: DurableObjectState, env: Env) {
+    super(state, env);
+    console.log(`MyMCP initialized:
       - Durable Object ID: ${state.id.toString()}
       - DO ID name: ${state.id.name || 'no name'}`);
   }
 
-  // MCP server instance for this agent
-  server = new McpServer({
-    name: "Personal Book Recommendations",
-    version: "1.0.0",
-  });
+  // Get the user's book preferences DO
+  get userPreferences(): DurableObjectStub<UserBookPreferences> {
+    const userId = this.props?.login || 'anonymous';
+    const userPreferencesId = this.env.USER_BOOK_PREFERENCES.idFromName(userId);
+    return this.env.USER_BOOK_PREFERENCES.get(userPreferencesId);
+  }
 
-  // Initial state when user first connects
-  initialState: BookPreferences = {
-    userName: "",
-    favoriteGenres: [],
-    booksRead: [],
-    sessionStarted: new Date().toISOString(),
-    interactionCount: 0,
-  };
+  private async getUserPreferences(): Promise<BookPreferences> {
+    try {
+      return await this.userPreferences.getPreferences();
+    } catch (error) {
+      console.error("Error getting user preferences:", error);
+      return {
+        userName: "",
+        favoriteGenres: [],
+        favoriteAuthors: [],
+        booksRead: [],
+        dislikedBooks: [],
+        dislikedAuthors: [],
+      };
+    }
+  }
+
+  private async updateUserPreferences(preferences: BookPreferences): Promise<void> {
+    await this.userPreferences.updatePreferences(preferences);
+  }
 
   async init() {
-    // Initialize user name from authentication context
+    console.log(`MyMCP init called - Props available:
+      - login: ${this.props?.login}
+      - name: ${this.props?.name}
+      - githubId: ${this.props?.githubId}`);
+
+    // Initialize MCP server
+    this.server = new McpServer({
+      name: "BestReads Book Recommendations",
+      version: "1.0.0",
+    });
+
+    // Initialize username from authentication context
     const userName = this.props?.name || this.props?.login || "Book Lover";
     
-    // Ensure state is properly initialized with defaults
-    this.setState({
-      userName,
-      favoriteGenres: this.state?.favoriteGenres || [],
-      booksRead: this.state?.booksRead || [],
-      sessionStarted: this.state?.sessionStarted || new Date().toISOString(),
-      interactionCount: (this.state?.interactionCount || 0),
-    });
+    const currentPreferences = await this.getUserPreferences();
+    if (currentPreferences.userName !== userName) {
+      currentPreferences.userName = userName;
+      await this.updateUserPreferences(currentPreferences);
+    }
 
     console.log(`Book Preferences agent initialized for ${userName}`);
 
+    // Register MCP tools
+    await this.registerTools();
+    
+    console.log(`BestReads MCP server ready with all tools initialized`);
+  }
+
+  private async registerTools() {
     // ================== MCP TOOLS ==================
 
-    this.server.tool("getProfile", "View your current reading preferences and statistics", {}, async () => {
-      // Ensure state arrays exist before accessing them
-      const genres = this.state?.favoriteGenres || [];
-      const books = this.state?.booksRead || [];
-      const startTime = this.state?.sessionStarted || new Date().toISOString();
-      const interactions = (this.state?.interactionCount || 0) + 1;
+    this.server.tool("getProfile", "View your reading history and preferences", {}, async () => {
+      const preferences = await this.getUserPreferences();
       
-      this.setState({
-        ...this.state,
-        favoriteGenres: genres,
-        booksRead: books,
-        sessionStarted: startTime,
-        interactionCount: interactions,
-      });
-
-      const sessionMinutes = Math.round((Date.now() - new Date(startTime).getTime()) / 1000 / 60);
+      const favoriteGenres = preferences.favoriteGenres || [];
+      const favoriteAuthors = preferences.favoriteAuthors || [];
+      const booksRead = preferences.booksRead || [];
+      const dislikedBooks = preferences.dislikedBooks || [];
+      const dislikedAuthors = preferences.dislikedAuthors || [];
       
       return {
         content: [
           {
             type: "text",
-            text: `📚 **${this.state.userName}'s Reading Profile**
+            text: `**${preferences.userName}'s Reading Profile**
 
-**Favorite Genres:** ${genres.join(", ") || "None yet - add some with addGenre!"}
+**Favorite Genres:** ${favoriteGenres.length > 0 ? favoriteGenres.join(", ") : "None yet"}
 
-**Books You've Rated:** ${books.length}
-${books.slice(-3).map(book => 
-  `• "${book.title}" by ${book.author} - ${"⭐".repeat(book.rating)} (${book.rating}/5)`
-).join('\n')}
+**Favorite Authors:** ${favoriteAuthors.length > 0 ? favoriteAuthors.join(", ") : "None yet"}
 
-**Session Info:**
-• Active for: ${sessionMinutes} minutes
-• Interactions: ${interactions}
-• GitHub User: ${this.props?.login || 'Anonymous'}
+**Books Read:** ${booksRead.length} books
+${booksRead.length > 0 ? booksRead.slice(-3).map(book => 
+  `• "${book.title}" by ${book.author}`
+).join('\n') : "None yet"}
 
-💡 *Use addGenre and rateBook tools to improve recommendations!*`,
+**Disliked Books:** ${dislikedBooks.length} books
+${dislikedBooks.length > 0 ? dislikedBooks.slice(-2).map(book => 
+  `• "${book.title}" by ${book.author}`
+).join('\n') : "None yet"}
+
+**Disliked Authors:** ${dislikedAuthors.length > 0 ? dislikedAuthors.join(", ") : "None yet"}
+
+**GitHub User:** ${this.props?.login || 'Anonymous'}
+
+Use the available tools to add your preferences for better recommendations.`,
           },
         ],
       };
@@ -128,49 +201,36 @@ ${books.slice(-3).map(book =>
         genre: z.string().describe("A book genre you like (e.g., 'science fiction', 'mystery', 'romance')"),
       },
       async ({ genre }) => {
-        // Ensure state is properly initialized before accessing arrays
-        const currentGenres = this.state?.favoriteGenres || [];
-        
-        this.setState({
-          ...this.state,
-          favoriteGenres: currentGenres,
-          interactionCount: (this.state?.interactionCount || 0) + 1,
-        });
-
+        const preferences = await this.getUserPreferences();
         const normalizedGenre = genre.toLowerCase().trim();
         
-        if (currentGenres.includes(normalizedGenre)) {
+        if (preferences.favoriteGenres.includes(normalizedGenre)) {
           return {
             content: [
               {
                 type: "text",
-                text: `"${genre}" is already in your favorites! 📚
+                text: `"${genre}" is already in your favorites!
 
-Current genres: ${currentGenres.join(", ")}`,
+Current genres: ${preferences.favoriteGenres.join(", ")}`,
               },
             ],
           };
         }
         
-        const updatedGenres = [...currentGenres, normalizedGenre];
+        preferences.favoriteGenres.push(normalizedGenre);
+        await this.updateUserPreferences(preferences);
         
-        this.setState({
-          ...this.state,
-          favoriteGenres: updatedGenres,
-          interactionCount: (this.state?.interactionCount || 0) + 1,
-        });
-        
-        const encouragement = updatedGenres.length === 1 
+        const encouragement = preferences.favoriteGenres.length === 1 
           ? "Great start! Add more genres to improve recommendations."
-          : `Perfect! With ${updatedGenres.length} genres, I'm learning your taste.`;
+          : `Perfect! With ${preferences.favoriteGenres.length} genres, I'm learning your taste.`;
         
         return {
           content: [
             {
               type: "text",
-              text: `✅ Added "${genre}" to your favorites!
+              text: `Added "${genre}" to your favorites!
 
-**Your favorite genres:** ${updatedGenres.join(", ")}
+**Your favorite genres:** ${preferences.favoriteGenres.join(", ")}
 
 ${encouragement}`,
             },
@@ -180,48 +240,46 @@ ${encouragement}`,
     );
 
     this.server.tool(
-      "rateBook",
-      "Rate a book you've read to improve future recommendations",
+      "addFavoriteAuthor",
+      "Add an author you enjoy reading",
       {
-        title: z.string().describe("The book title"),
-        author: z.string().describe("The book author"), 
-        rating: z.number().min(1).max(5).describe("Your rating from 1 (didn't like) to 5 (loved it)"),
+        author: z.string().describe("An author you like (e.g., 'J.K. Rowling', 'Stephen King', 'Agatha Christie')"),
       },
-      async ({ title, author, rating }) => {
-        this.setState({
-          ...this.state,
-          interactionCount: this.state.interactionCount + 1,
-        });
+      async ({ author }) => {
+        const preferences = await this.getUserPreferences();
+        const normalizedAuthor = author.trim();
+        const favoriteAuthors = preferences.favoriteAuthors || [];
+        
+        if (favoriteAuthors.includes(normalizedAuthor)) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `"${author}" is already in your favorite authors!
 
-        const bookEntry = {
-          title,
-          author,
-          rating,
-          dateAdded: new Date().toISOString(),
-        };
+Current favorite authors: ${favoriteAuthors.join(", ")}`,
+              },
+            ],
+          };
+        }
         
-        this.setState({
-          ...this.state,
-          booksRead: [...this.state.booksRead, bookEntry],
-        });
+        favoriteAuthors.push(normalizedAuthor);
+        preferences.favoriteAuthors = favoriteAuthors;
+        await this.updateUserPreferences(preferences);
         
-        const stars = "⭐".repeat(rating);
-        const reaction = rating >= 4 ? "Great choice!" : rating >= 3 ? "Nice read!" : "Thanks for the honest rating!";
+        const encouragement = favoriteAuthors.length === 1 
+          ? "Great start! Add more authors to improve recommendations."
+          : `Perfect! With ${favoriteAuthors.length} favorite authors, I'm learning your taste.`;
         
         return {
           content: [
             {
               type: "text",
-              text: `📖 Rated "${title}" by ${author}
+              text: `Added "${author}" to your favorite authors!
 
-${stars} **${rating}/5** - ${reaction}
+**Your favorite authors:** ${favoriteAuthors.join(", ")}
 
-**Your reading history:** ${this.state.booksRead.length} books rated
-${this.state.booksRead.slice(-3).map(book => 
-  `• "${book.title}" - ${"⭐".repeat(book.rating)}`
-).join('\n')}
-
-💡 *The more books you rate, the better recommendations I can give!*`,
+${encouragement}`,
             },
           ],
         };
@@ -229,57 +287,248 @@ ${this.state.booksRead.slice(-3).map(book =>
     );
 
     this.server.tool(
-      "getRecommendations", 
-      "Get personalized book recommendations based on your preferences",
+      "addBookRead",
+      "Add a book you have read",
       {
-        count: z.number().min(1).max(5).default(3).describe("Number of books to recommend (1-5)"),
+        title: z.string().describe("The book title"),
+        author: z.string().describe("The book author"), 
       },
-      async ({ count }) => {
-        this.setState({
-          ...this.state,
-          interactionCount: this.state.interactionCount + 1,
-        });
+      async ({ title, author }) => {
+        const preferences = await this.getUserPreferences();
+        
+        const booksRead = preferences.booksRead || [];
+        
+        const bookExists = booksRead.some(
+          book => book.title.toLowerCase() === title.toLowerCase() && 
+                  book.author.toLowerCase() === author.toLowerCase()
+        );
+        
+        if (bookExists) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `"${title}" by ${author} is already in your reading list!`,
+              },
+            ],
+          };
+        }
+        
+        const bookEntry = {
+          title,
+          author,
+          dateAdded: new Date().toISOString(),
+        };
+        
+        booksRead.push(bookEntry);
+        preferences.booksRead = booksRead;
+        await this.updateUserPreferences(preferences);
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Added "${title}" by ${author} to your reading list!
 
+**Total books read:** ${booksRead.length}
+**Recent reads:** 
+${booksRead.slice(-3).map(book => 
+  `• "${book.title}" by ${book.author}`
+).join('\n')}`,
+            },
+          ],
+        };
+      }
+    );
+
+    this.server.tool(
+      "addDislikedBook",
+      "Add a book you didn't like",
+      {
+        title: z.string().describe("The book title"),
+        author: z.string().describe("The book author"), 
+      },
+      async ({ title, author }) => {
+        const preferences = await this.getUserPreferences();
+        const dislikedBooks = preferences.dislikedBooks || [];
+        const bookExists = dislikedBooks.some(
+          book => book.title.toLowerCase() === title.toLowerCase() && 
+                  book.author.toLowerCase() === author.toLowerCase()
+        );
+        
+        if (bookExists) {
+          return {
+            content: [
+              {
+                type: "text",
+              text: `"${title}" by ${author} is already in your disliked books list!`,
+              },
+            ],
+          };
+        }
+        
+        const bookEntry = {
+          title,
+          author,
+          dateAdded: new Date().toISOString(),
+        };
+        
+        dislikedBooks.push(bookEntry);
+        preferences.dislikedBooks = dislikedBooks;
+        await this.updateUserPreferences(preferences);
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Added "${title}" by ${author} to your disliked books list.
+
+This will help me avoid recommending similar books or this author in the future.`,
+            },
+          ],
+        };
+      }
+    );
+
+    this.server.tool(
+      "addDislikedAuthor",
+      "Add an author you don't like",
+      {
+        author: z.string().describe("An author you don't like"),
+      },
+      async ({ author }) => {
+        const preferences = await this.getUserPreferences();
+        const normalizedAuthor = author.trim();
+        const dislikedAuthors = preferences.dislikedAuthors || [];
+        
+        if (dislikedAuthors.includes(normalizedAuthor)) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `"${author}" is already in your disliked authors list!
+
+Current disliked authors: ${dislikedAuthors.join(", ")}`,
+              },
+            ],
+          };
+        }
+        
+        dislikedAuthors.push(normalizedAuthor);
+        preferences.dislikedAuthors = dislikedAuthors;
+        await this.updateUserPreferences(preferences);
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Added "${author}" to your disliked authors list.
+
+This will help me avoid recommending books by this author in the future.`,
+            },
+          ],
+        };
+      }
+    );
+
+    this.server.tool(
+      "clearPreferences",
+      "Clear all your reading preferences and start fresh",
+      {},
+      async () => {
+        const preferences = await this.getUserPreferences();
+        const clearedPreferences: BookPreferences = {
+          userName: preferences.userName,
+          favoriteGenres: [],
+          favoriteAuthors: [],
+          booksRead: [],
+          dislikedBooks: [],
+          dislikedAuthors: [],
+        };
+        
+        await this.updateUserPreferences(clearedPreferences);
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: `🧹 **All preferences cleared for ${preferences.userName}!**
+    
+    Your reading profile has been reset:
+    • Favorite genres: cleared
+    • Favorite authors: cleared  
+    • Books read: cleared
+    • Disliked books: cleared
+    • Disliked authors: cleared
+    
+    You can start building your preferences again using the available tools.`,
+            },
+          ],
+        };
+      }
+    );
+
+    this.server.tool(
+      "getBookRecommendations", 
+      "Get personalized book recommendations based on your preferences",
+      {},
+      async () => {
+        const preferences = await this.getUserPreferences();
+        
         // Build contextual prompt for AI recommendations
-        let prompt = `Recommend ${count} books for ${this.state.userName}. `;
+        let prompt = `Recommend 3 books for ${preferences.userName}. `;
         
-        if (this.state.favoriteGenres.length > 0) {
-          prompt += `They enjoy these genres: ${this.state.favoriteGenres.join(", ")}. `;
+        if (preferences.favoriteGenres.length > 0) {
+          prompt += `They enjoy these genres: ${preferences.favoriteGenres.join(", ")}. `;
         }
         
-        if (this.state.booksRead.length > 0) {
-          const recentBooks = this.state.booksRead.slice(-3).map(b => 
-            `"${b.title}" by ${b.author} (rated ${b.rating}/5)`
+        if (preferences.favoriteAuthors.length > 0) {
+          prompt += `They like these authors: ${preferences.favoriteAuthors.join(", ")}. `;
+        }
+        
+        if (preferences.booksRead.length > 0) {
+          const recentBooks = preferences.booksRead.slice(-5).map(b => 
+            `"${b.title}" by ${b.author}`
           );
-          prompt += `Recent reads: ${recentBooks.join(", ")}. `;
-          
-          const avgRating = this.state.booksRead.reduce((sum, b) => sum + b.rating, 0) / this.state.booksRead.length;
-          prompt += `Average rating: ${avgRating.toFixed(1)}/5. `;
+          prompt += `They have read: ${recentBooks.join(", ")}. `;
         }
         
-        prompt += `Provide specific book recommendations with title, author, and brief explanation of why they'd enjoy it based on their preferences.`;
+        if (preferences.dislikedBooks.length > 0) {
+          const dislikedBooks = preferences.dislikedBooks.map(b => 
+            `"${b.title}" by ${b.author}`
+          );
+          prompt += `They disliked these books: ${dislikedBooks.join(", ")}. `;
+        }
+        
+        if (preferences.dislikedAuthors.length > 0) {
+          prompt += `They don't like these authors: ${preferences.dislikedAuthors.join(", ")}. `;
+        }
+        
+        prompt += `Provide specific book recommendations with title, author, and brief explanation of why they'd enjoy it. Avoid recommending books they've already read or authors they dislike.`;
         
         try {
-          // Use Cloudflare Workers AI for recommendations
-          const response = await this.env.AI.run("@cf/meta/llama-3-8b-instruct", {
+          // Generate recommendation by using Workers AI
+          const response = await this.env.AI.run("@cf/meta/llama-3.1-8b-instruct-fast", {
             prompt,
             max_tokens: 600,
           });
           
-          // Show what context was used for transparency
           const contextUsed = [];
-          if (this.state.favoriteGenres.length > 0) contextUsed.push(`${this.state.favoriteGenres.length} favorite genres`);
-          if (this.state.booksRead.length > 0) contextUsed.push(`${this.state.booksRead.length} rated books`);
+          if (preferences.favoriteGenres.length > 0) contextUsed.push(`${preferences.favoriteGenres.length} favorite genres`);
+          if (preferences.favoriteAuthors.length > 0) contextUsed.push(`${preferences.favoriteAuthors.length} favorite authors`);
+          if (preferences.booksRead.length > 0) contextUsed.push(`${preferences.booksRead.length} books read`);
+          if (preferences.dislikedBooks.length > 0) contextUsed.push(`${preferences.dislikedBooks.length} disliked books`);
+          if (preferences.dislikedAuthors.length > 0) contextUsed.push(`${preferences.dislikedAuthors.length} disliked authors`);
           
           const contextText = contextUsed.length > 0 
-            ? `\n\n🎯 *Personalized based on: ${contextUsed.join(", ")}*`
-            : "\n\n💡 *Add genres and rate books for more personalized recommendations!*";
+            ? `\n\nPersonalized based on: ${contextUsed.join(", ")}.`
+            : "\n\nAdd your preferences using the available tools for more personalized recommendations.";
           
           return {
             content: [
               {
                 type: "text",
-                text: `📚 **Personalized Recommendations for ${this.state.userName}:**
+                text: `**Personalized Recommendations for ${preferences.userName}:**
 
 ${response.response}${contextText}`,
               },
@@ -298,78 +547,41 @@ ${response.response}${contextText}`,
         }
       }
     );
-
-    console.log(`✅ Book Preferences MCP server ready with all tools initialized`);
-  }
-
-  // Called when user state changes - useful for logging and analytics
-  onStateUpdate(state: BookPreferences) {
-    console.log(`📊 ${state.userName}: ${state.favoriteGenres.length} genres, ${state.booksRead.length} books, ${state.interactionCount} interactions`);
   }
 }
 
+// Using the correct OAuth Provider pattern based on the actual library API
 export default new OAuthProvider({
-  // Protect the MCP SSE endpoint with OAuth
-  apiRoute: '/sse',
-  
-  // Create API handler using MyMCP's mount method
-  apiHandler: MyMCP.mount('/sse', {
-    binding: 'MCP_OBJECT',
-    corsOptions: {
-      origin: "*",
-      methods: "GET, POST, OPTIONS",
-      headers: "Content-Type, Authorization",
-      maxAge: 86400
-    }
-  }),
-  
-  // GitHub OAuth authentication handler
-  defaultHandler: {
-    fetch: async (request: Request, env: Env, ctx: any) => {
-      const url = new URL(request.url);
-      
-      // Add a token info endpoint for sharing tokens across clients
-      if (url.pathname === '/token-info' && request.method === 'GET') {
-        // This endpoint is protected by OAuth and returns current user's token info
-        try {
-          const authHeader = request.headers.get('Authorization');
-          if (!authHeader?.startsWith('Bearer ')) {
-            return new Response('Unauthorized', { status: 401 });
-          }
-          
-          const token = authHeader.slice(7);
-          
-          // Validate token with OAuth provider
-          const tokenInfo = await env.OAUTH_PROVIDER.validateAccessToken?.(token);
-          if (!tokenInfo) {
-            return new Response('Invalid token', { status: 401 });
-          }
-          
-          return new Response(JSON.stringify({
-            token: token,
-            user: tokenInfo.props,
-            instructions: {
-              mcp_url: `${url.origin}/sse`,
-              usage: "Use this token in your MCP client's Authorization header as 'Bearer <token>'"
-            }
-          }), {
-            headers: {
-              'Content-Type': 'application/json',
-              'Access-Control-Allow-Origin': '*'
-            }
-          });
-        } catch (error) {
-          return new Response('Error retrieving token info', { status: 500 });
-        }
+  // Configure API routes for MCP - these will have OAuth protection
+  apiHandlers: {
+    '/mcp': MyMCP.serve('/mcp', {
+      binding: 'MCP_OBJECT',
+      corsOptions: {
+        origin: "*",
+        methods: "GET, POST, OPTIONS",
+        headers: "Content-Type, Authorization",
+        maxAge: 86400
       }
-      
-      // Route all other requests to GitHubHandler
-      return GitHubHandler.fetch(request, env, ctx);
-    }
+    }),
+    '/sse': MyMCP.serveSSE('/sse', {
+      binding: 'MCP_OBJECT', 
+      corsOptions: {
+        origin: "*",
+        methods: "GET, POST, OPTIONS",
+        headers: "Content-Type, Authorization, Cache-Control, Last-Event-ID",
+        maxAge: 86400
+      }
+    }),
   },
   
-  // OAuth endpoints
+  // The default handler handles OAuth flow and other non-API requests
+  defaultHandler: GitHubHandler,
+  
+  // OAuth endpoint configuration
   authorizeEndpoint: "/authorize",
-  tokenEndpoint: "/token",
+  tokenEndpoint: "/token", 
   clientRegistrationEndpoint: "/register",
+  scopesSupported: ["read:user", "user:email"],
+  // Add access token TTL (optional)
+  accessTokenTTL: 3600, // 1 hour
 });
